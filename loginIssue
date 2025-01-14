@@ -1,0 +1,14 @@
+Check with every database. copy user name >go to new page 
+
+USE
+AdminDB
+
+EXEC sp_change_users_login 'report'
+
+GO
+
+>>>change user name and select database execute the code. change inside single cote.>> 
+
+
+
+sp_change_users_login 'update_one', 'tc.bharathi', 'tc.bharathi'
