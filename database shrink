@@ -1,0 +1,12 @@
+Backup Database DatabaseName
+To DISK='c:\Temp\DatabaseName.bak';
+Go
+
+Alter Database DatabaseName SET RECOVERY SIMPLE
+GO
+
+DBCC SHRINKDATABASE (DatabaseName, 20, TRUNCATEONLY)
+GO
+
+ALTER DATABASE DatabaseName SET RECOVERY FULL
+GO
