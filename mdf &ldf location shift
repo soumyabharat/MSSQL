@@ -1,0 +1,42 @@
+---Check--
+select 
+    d.name as 'database',
+    mdf.physical_name as 'mdf_file',
+    ldf.physical_name as 'log_file'
+from sys.databases d
+inner join sys.master_files mdf on 
+    d.database_id = mdf.database_id and mdf.[type] = 0
+inner join sys.master_files ldf on 
+    d.database_id = ldf.database_id and ldf.[type] = 1
+
+
+
+++++++++++++++++++++++++++++++++++++++++++++++
+
+ALTER DATABASE [databasename-CONNECT] SET OFFLINE;  
+GO
+
+
++++++++++++++++++++++++++++++++++++
+
+Move mdf file & lDF file to new location 
+
+++++++++++++++++++++++++++++++++++
+
+
+
+ALTER DATABASE [databasename-CONNECT]   
+    MODIFY FILE ( NAME = [databasename-CONNECT],   
+                  FILENAME = 'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\DATA\databasename-CONNECT.mdf');  
+GO
+ 
+ALTER DATABASE [databasename-CONNECT]   
+    MODIFY FILE ( NAME = [databasename-CONNECT_log],   
+                  FILENAME = 'C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\DATA\databasename-CONNECT.ldf');  
+GO
+
+++++++++++++++++++++++++++++++++++++++++++++++++++
+
+ALTER DATABASE [databasename-CONNECT] SET ONLINE;  
+GO
+
