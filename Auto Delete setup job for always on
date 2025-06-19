@@ -1,12 +1,17 @@
 //setp -1 : Crete store procedure 
 
-USE master;
+USE db11;  -- Replace with actual DB name
 GO
 
-IF sys.fn_hadr_is_primary_replica('db11') = 1
+CREATE PROCEDURE usp_DeleteOldRecords
+AS
 BEGIN
-    EXEC db11.dbo.usp_DeleteOldRecords;
+    SET NOCOUNT ON;
+
+    DELETE FROM Table_2  -- Replace with your table name
+    WHERE Date < DATEADD(YEAR, -1, GETDATE());
 END
+GO
 
 
 //Step-2 Crete job for Delete
