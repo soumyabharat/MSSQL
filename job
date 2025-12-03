@@ -1,0 +1,1 @@
+C:\Program Files\Microsoft SQL Server\160\DTS\Binn\DTExec.exe /SQL "\"Maintenance Plans\VPMDB_MaintenancePlan\"" /SERVER "\"PW01DQL1\CHINTU\""  /CHECKPOINTING OFF /SET "\"\Package\Subplan_1.Disable\"";false /REPORTING E
