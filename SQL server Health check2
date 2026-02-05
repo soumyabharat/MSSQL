@@ -4,7 +4,7 @@ GO
 CREATE OR ALTER PROCEDURE dbo.usp_SendDailySummaryReport_All
 (
       @profile_name          sysname        = N'DBA'
-    , @recipients            nvarchar(max)  = N'soumya.bharat@hitachids.com'
+    , @recipients            nvarchar(max)  = N'**********s.com'
     , @copy_recipients       nvarchar(max)  = NULL
     , @subject               nvarchar(255)  = N'Daily SQL Server Summary Report'
     , @include_system_dbs    bit            = 0
