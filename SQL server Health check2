@@ -1,0 +1,588 @@
+USE [master];
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_SendDailySummaryReport_All
+(
+      @profile_name          sysname        = N'DBA'
+    , @recipients            nvarchar(max)  = N'soumya.bharat@hitachids.com'
+    , @copy_recipients       nvarchar(max)  = NULL
+    , @subject               nvarchar(255)  = N'Daily SQL Server Summary Report'
+    , @include_system_dbs    bit            = 0
+    , @send_mail             bit            = 1     -- 1=send email, 0=return HTML
+    , @low_disk_pct_free     decimal(5,2)   = 20    -- disk alert threshold
+    , @include_table_details bit            = 1     -- include top table sizes
+    , @top_tables_per_db     int            = 10    -- top N tables per DB
+    , @min_table_mb          decimal(19,2)  = 10    -- tables >= this size only
+    , @include_job_summary   bit            = 1     -- enabled job summary section
+    , @failed_jobs_only_24h  bit            = 0     -- 1=failed jobs only last 24h
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    BEGIN TRY
+        ---------------------------------------------------------------------
+        -- Server properties
+        ---------------------------------------------------------------------
+        DECLARE
+              @ServerName      sysname       = CONVERT(sysname, SERVERPROPERTY(N'ServerName'))
+            , @InstanceName    sysname       = CONVERT(sysname, SERVERPROPERTY(N'InstanceName'))
+            , @MachineName     sysname       = CONVERT(sysname, SERVERPROPERTY(N'MachineName'))
+            , @Edition         nvarchar(128) = CONVERT(nvarchar(128), SERVERPROPERTY(N'Edition'))
+            , @ProductVersion  nvarchar(128) = CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductVersion'))
+            , @ProductLevel    nvarchar(128) = CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductLevel'))
+            , @IsClustered     nvarchar(32)  = CASE SERVERPROPERTY(N'IsClustered') WHEN 1 THEN N'Clustered' WHEN 0 THEN N'Non-Clustered' ELSE N'Unknown' END
+            , @IsSingleUser    nvarchar(32)  = CASE SERVERPROPERTY(N'IsSingleUser') WHEN 1 THEN N'Single User' WHEN 0 THEN N'Multi User' ELSE N'Unknown' END
+            , @Collation       nvarchar(128) = CONVERT(nvarchar(128), SERVERPROPERTY(N'Collation'))
+            , @Now             datetime2(0)  = SYSDATETIME();
+
+        DECLARE
+              @StartTime datetime2(0)
+            , @CpuCount  int
+            , @MemoryMB  bigint;
+
+        SELECT
+              @StartTime = sqlserver_start_time
+            , @CpuCount  = cpu_count
+            , @MemoryMB  = committed_kb / 1024
+        FROM sys.dm_os_sys_info;
+
+        ---------------------------------------------------------------------
+        -- HTML template
+        ---------------------------------------------------------------------
+        DECLARE @Html nvarchar(max) = N''
+        + N'<!DOCTYPE html><html><head><meta charset="utf-8" />'
+        + N'<style>'
+        + N'body{font-family:Verdana,Arial,sans-serif;font-size:12px;color:#222;}'
+        + N'h2{margin:14px 0 6px 0;font-size:16px;}'
+        + N'h3{margin:12px 0 6px 0;font-size:14px;}'
+        + N'table{border-collapse:collapse;width:98%;margin:6px 0 16px 0;}'
+        + N'th,td{border:1px solid #bbb;padding:6px 8px;font-size:11px;}'
+        + N'th{background:#4F81BD;color:#fff;text-align:left;}'
+        + N'.ok{color:#1a7f37;font-weight:bold;}'
+        + N'.warn{color:#b35c00;font-weight:bold;}'
+        + N'.bad{color:#b00020;font-weight:bold;}'
+        + N'.small{font-size:10px;color:#444;}'
+        + N'</style></head><body>'
+        + N'<h2>Daily SQL Server Summary Report</h2>'
+        + N'<div>Generated: <b>' + CONVERT(nvarchar(30), @Now, 120) + N'</b></div>';
+
+        ---------------------------------------------------------------------
+        -- Server Info section
+        ---------------------------------------------------------------------
+        SET @Html += N'<h3>Server Information</h3>'
+        + N'<table><tr>'
+        + N'<th>Server</th><th>Machine</th><th>Instance</th><th>Version</th><th>Level</th><th>Edition</th>'
+        + N'<th>Cluster</th><th>User Mode</th><th>Collation</th><th>SQL Start Time</th><th>CPU</th><th>Memory (MB)</th>'
+        + N'</tr><tr>'
+        + N'<td>' + ISNULL(@ServerName,N'-') + N'</td>'
+        + N'<td>' + ISNULL(@MachineName,N'-') + N'</td>'
+        + N'<td>' + ISNULL(@InstanceName,N'(Default)') + N'</td>'
+        + N'<td>' + ISNULL(@ProductVersion,N'-') + N'</td>'
+        + N'<td>' + ISNULL(@ProductLevel,N'-') + N'</td>'
+        + N'<td>' + ISNULL(@Edition,N'-') + N'</td>'
+        + N'<td>' + ISNULL(@IsClustered,N'-') + N'</td>'
+        + N'<td>' + ISNULL(@IsSingleUser,N'-') + N'</td>'
+        + N'<td>' + ISNULL(@Collation,N'-') + N'</td>'
+        + N'<td>' + CONVERT(nvarchar(30), @StartTime, 120) + N'</td>'
+        + N'<td>' + CONVERT(nvarchar(20), @CpuCount) + N'</td>'
+        + N'<td>' + CONVERT(nvarchar(30), @MemoryMB) + N'</td>'
+        + N'</tr></table>';
+
+        ---------------------------------------------------------------------
+        -- Disk / Volume stats (SQL-hosting volumes only)
+        -- NOTE: dm_os_volume_stats returns only volumes that host SQL files
+        ---------------------------------------------------------------------
+        ;WITH Volumes AS
+        (
+            SELECT
+                  v.volume_mount_point
+                , v.logical_volume_name
+                , total_gb = CAST(v.total_bytes / 1024.0 / 1024.0 / 1024.0 AS decimal(19,2))
+                , free_gb  = CAST(v.available_bytes / 1024.0 / 1024.0 / 1024.0 AS decimal(19,2))
+                , used_gb  = CAST((v.total_bytes - v.available_bytes) / 1024.0 / 1024.0 / 1024.0 AS decimal(19,2))
+                , pct_free = CAST((v.available_bytes * 100.0) / NULLIF(v.total_bytes,0) AS decimal(9,2))
+            FROM sys.master_files AS mf
+            CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS v
+            GROUP BY v.volume_mount_point, v.logical_volume_name, v.total_bytes, v.available_bytes
+        )
+        SELECT @Html +=
+            N'<h3>Disk / Volume Statistics (SQL-hosting volumes)</h3>'
+          + N'<table><tr>'
+          + N'<th>Volume</th><th>Label</th><th>Total (GB)</th><th>Used (GB)</th><th>Free (GB)</th><th>% Free</th><th>Alert</th>'
+          + N'</tr>'
+          + ISNULL((
+                SELECT STRING_AGG(
+                    CAST(
+                        N'<tr>'
+                      + N'<td>' + CAST(v.volume_mount_point AS nvarchar(512)) + N'</td>'
+                      + N'<td>' + CAST(ISNULL(NULLIF(v.logical_volume_name, N''), N'-') AS nvarchar(512)) + N'</td>'
+                      + N'<td>' + CONVERT(nvarchar(30), v.total_gb) + N'</td>'
+                      + N'<td>' + CONVERT(nvarchar(30), v.used_gb)  + N'</td>'
+                      + N'<td>' + CONVERT(nvarchar(30), v.free_gb)  + N'</td>'
+                      + N'<td>' + CONVERT(nvarchar(30), v.pct_free) + N'</td>'
+                      + N'<td>' + CASE WHEN v.pct_free < @low_disk_pct_free THEN N'<span class="bad">LOW</span>' ELSE N'<span class="ok">OK</span>' END + N'</td>'
+                      + N'</tr>'
+                    AS nvarchar(max)
+                    ) COLLATE DATABASE_DEFAULT
+                , N'') WITHIN GROUP (ORDER BY v.pct_free ASC, v.volume_mount_point COLLATE DATABASE_DEFAULT)
+                FROM Volumes v
+            ), N'<tr><td colspan="7">No volumes found via dm_os_volume_stats.</td></tr>')
+          + N'</table>';
+
+        ---------------------------------------------------------------------
+        -- Database details + size + last backups (Full/Diff/Log)
+        ---------------------------------------------------------------------
+        ;WITH DbBase AS
+        (
+            SELECT
+                  d.database_id
+                , d.name
+                , d.create_date
+                , owner_name = SUSER_SNAME(d.owner_sid)
+                , d.state_desc
+                , d.user_access_desc
+                , d.compatibility_level
+                , d.recovery_model_desc
+            FROM sys.databases d
+            WHERE (@include_system_dbs = 1 OR d.database_id > 4)
+        ),
+        DbSize AS
+        (
+            SELECT
+                  database_id
+                , data_mb = SUM(CASE WHEN type_desc = 'ROWS' THEN size END) * 8.0 / 1024
+                , log_mb  = SUM(CASE WHEN type_desc = 'LOG'  THEN size END) * 8.0 / 1024
+            FROM sys.master_files
+            GROUP BY database_id
+        ),
+        LastBackups AS
+        (
+            SELECT
+                  bs.database_name
+                , last_full_finish = MAX(CASE WHEN bs.type = 'D' THEN bs.backup_finish_date END)
+                , last_diff_finish = MAX(CASE WHEN bs.type = 'I' THEN bs.backup_finish_date END)
+                , last_log_finish  = MAX(CASE WHEN bs.type = 'L' THEN bs.backup_finish_date END)
+            FROM msdb.dbo.backupset bs
+            GROUP BY bs.database_name
+        )
+        SELECT @Html +=
+            N'<h3>Database Details</h3>'
+          + N'<table><tr>'
+          + N'<th>Database</th><th>Created</th><th>Owner</th><th>State</th><th>Access</th>'
+          + N'<th>Compat</th><th>Recovery</th><th>Data (MB)</th><th>Log (MB)</th>'
+          + N'<th>Last Full</th><th>Last Diff</th><th>Last Log</th>'
+          + N'</tr>'
+          + ISNULL((
+                SELECT STRING_AGG(
+                    CAST(
+                        N'<tr>'
+                      + N'<td>' + CAST(b.name AS nvarchar(256)) + N'</td>'
+                      + N'<td>' + CONVERT(nvarchar(30), b.create_date, 120) + N'</td>'
+                      + N'<td>' + CAST(ISNULL(b.owner_name, N'-') AS nvarchar(256)) + N'</td>'
+                      + N'<td>'
+                      + CASE WHEN b.state_desc = 'ONLINE' THEN N'<span class="ok">ONLINE</span>'
+                             WHEN b.state_desc IN ('RESTORING','RECOVERING') THEN N'<span class="warn">' + CAST(b.state_desc AS nvarchar(60)) + N'</span>'
+                             ELSE N'<span class="bad">' + CAST(b.state_desc AS nvarchar(60)) + N'</span>'
+                        END
+                      + N'</td>'
+                      + N'<td>' + CAST(b.user_access_desc AS nvarchar(60)) + N'</td>'
+                      + N'<td>' + CONVERT(nvarchar(10), b.compatibility_level) + N'</td>'
+                      + N'<td>' + CAST(b.recovery_model_desc AS nvarchar(60)) + N'</td>'
+                      + N'<td>' + CONVERT(nvarchar(30), CAST(ISNULL(s.data_mb,0) AS decimal(19,2))) + N'</td>'
+                      + N'<td>' + CONVERT(nvarchar(30), CAST(ISNULL(s.log_mb,0)  AS decimal(19,2))) + N'</td>'
+                      + N'<td>' + ISNULL(CONVERT(nvarchar(30), lb.last_full_finish, 120), N'-') + N'</td>'
+                      + N'<td>' + ISNULL(CONVERT(nvarchar(30), lb.last_diff_finish, 120), N'-') + N'</td>'
+                      + N'<td>' + ISNULL(CONVERT(nvarchar(30), lb.last_log_finish,  120), N'-') + N'</td>'
+                      + N'</tr>'
+                    AS nvarchar(max)
+                    ) COLLATE DATABASE_DEFAULT
+                , N'') WITHIN GROUP (ORDER BY b.name COLLATE DATABASE_DEFAULT)
+                FROM DbBase b
+                LEFT JOIN DbSize s       ON s.database_id = b.database_id
+                LEFT JOIN LastBackups lb ON lb.database_name = b.name
+            ), N'<tr><td colspan="12">No databases matched filter.</td></tr>')
+          + N'</table>';
+
+        ---------------------------------------------------------------------
+        -- FAILED JOB LIST (separate section)
+        ---------------------------------------------------------------------
+        ;WITH JobBase AS
+        (
+            SELECT
+                  j.job_id
+                , j.name AS job_name
+                , j.enabled
+                , category_name = c.name
+                , owner_name = SUSER_SNAME(j.owner_sid)
+            FROM msdb.dbo.sysjobs j
+            INNER JOIN msdb.dbo.syscategories c
+                ON j.category_id = c.category_id
+        ),
+        LastOutcome AS
+        (
+            SELECT
+                  h.job_id
+                , last_run_dt =
+                    DATEADD(SECOND,
+                        (h.run_time/10000)*3600 + ((h.run_time%10000)/100)*60 + (h.run_time%100),
+                        CONVERT(datetime, CONVERT(char(8), h.run_date), 112)
+                    )
+                , run_status = h.run_status
+                , run_status_desc =
+                    CASE h.run_status
+                        WHEN 0 THEN 'Failed'
+                        WHEN 1 THEN 'Succeeded'
+                        WHEN 2 THEN 'Retry'
+                        WHEN 3 THEN 'Canceled'
+                        WHEN 4 THEN 'In Progress'
+                        ELSE 'Unknown'
+                    END
+                , run_duration = h.run_duration
+                , message = h.message
+                , rn = ROW_NUMBER() OVER (PARTITION BY h.job_id ORDER BY h.instance_id DESC)
+            FROM msdb.dbo.sysjobhistory h
+            WHERE h.step_id = 0
+        ),
+        NextRun AS
+        (
+            SELECT
+                  js.job_id
+                , next_run_dt =
+                    CASE WHEN js.next_run_date = 0 THEN NULL
+                         ELSE DATEADD(SECOND,
+                                (js.next_run_time/10000)*3600 + ((js.next_run_time%10000)/100)*60 + (js.next_run_time%100),
+                                CONVERT(datetime, CONVERT(char(8), js.next_run_date), 112)
+                              )
+                    END
+            FROM msdb.dbo.sysjobschedules js
+        ),
+        FailedJobs AS
+        (
+            SELECT
+                  jb.job_name
+                , jb.category_name
+                , jb.owner_name
+                , lo.last_run_dt
+                , duration_sec =
+                    ((lo.run_duration/10000)*3600) + (((lo.run_duration%10000)/100)*60) + (lo.run_duration%100)
+                , lo.message
+                , nr.next_run_dt
+            FROM JobBase jb
+            INNER JOIN (SELECT * FROM LastOutcome WHERE rn = 1) lo
+                ON lo.job_id = jb.job_id
+            LEFT JOIN (SELECT job_id, MIN(next_run_dt) AS next_run_dt FROM NextRun GROUP BY job_id) nr
+                ON nr.job_id = jb.job_id
+            WHERE jb.enabled = 1
+              AND lo.run_status_desc = 'Failed'
+              AND (@failed_jobs_only_24h = 0 OR lo.last_run_dt >= DATEADD(HOUR, -24, GETDATE()))
+        )
+        SELECT @Html +=
+            N'<h3>Failed Jobs (Last Run)</h3>'
+          + N'<table><tr>'
+          + N'<th>Job</th><th>Category</th><th>Owner</th><th>Last Run</th><th>Duration (sec)</th><th>Next Run</th><th>Message</th>'
+          + N'</tr>'
+          + CASE WHEN EXISTS (SELECT 1 FROM FailedJobs)
+                 THEN ISNULL((
+                    SELECT STRING_AGG(
+                        CAST(
+                            N'<tr>'
+                          + N'<td>' + CAST(job_name AS nvarchar(512)) + N'</td>'
+                          + N'<td>' + CAST(category_name AS nvarchar(256)) + N'</td>'
+                          + N'<td>' + CAST(ISNULL(owner_name,N'-') AS nvarchar(256)) + N'</td>'
+                          + N'<td>' + CONVERT(nvarchar(30), last_run_dt, 120) + N'</td>'
+                          + N'<td>' + CONVERT(nvarchar(30), duration_sec) + N'</td>'
+                          + N'<td>' + ISNULL(CONVERT(nvarchar(30), next_run_dt, 120), N'-') + N'</td>'
+                          + N'<td class="small">' + CAST(ISNULL(message,N'-') AS nvarchar(2000)) + N'</td>'
+                          + N'</tr>'
+                        AS nvarchar(max)
+                        ) COLLATE DATABASE_DEFAULT
+                    , N'') WITHIN GROUP (ORDER BY last_run_dt DESC)
+                    FROM FailedJobs
+                 ), N'')
+                 ELSE N'<tr><td colspan="7"><span class="ok">No failed jobs found.</span></td></tr>'
+            END
+          + N'</table>';
+
+        ---------------------------------------------------------------------
+        -- JOB SUMMARY (enabled jobs) - optional
+        ---------------------------------------------------------------------
+        IF @include_job_summary = 1
+        BEGIN
+            ;WITH JobBase2 AS
+            (
+                SELECT
+                      j.job_id
+                    , j.name AS job_name
+                    , j.enabled
+                    , category_name = c.name
+                    , owner_name = SUSER_SNAME(j.owner_sid)
+                FROM msdb.dbo.sysjobs j
+                INNER JOIN msdb.dbo.syscategories c
+                    ON j.category_id = c.category_id
+            ),
+            LastRun2 AS
+            (
+                SELECT
+                      h.job_id
+                    , last_run_dt =
+                        DATEADD(SECOND,
+                            (h.run_time/10000)*3600 + ((h.run_time%10000)/100)*60 + (h.run_time%100),
+                            CONVERT(datetime, CONVERT(char(8), h.run_date), 112)
+                        )
+                    , run_status_desc =
+                        CASE h.run_status
+                            WHEN 0 THEN 'Failed'
+                            WHEN 1 THEN 'Succeeded'
+                            WHEN 2 THEN 'Retry'
+                            WHEN 3 THEN 'Canceled'
+                            WHEN 4 THEN 'In Progress'
+                            ELSE 'Unknown'
+                        END
+                    , rn = ROW_NUMBER() OVER (PARTITION BY h.job_id ORDER BY h.instance_id DESC)
+                FROM msdb.dbo.sysjobhistory h
+                WHERE h.step_id = 0
+            ),
+            NextRun2 AS
+            (
+                SELECT
+                      js.job_id
+                    , next_run_dt =
+                        CASE WHEN js.next_run_date = 0 THEN NULL
+                             ELSE DATEADD(SECOND,
+                                    (js.next_run_time/10000)*3600 + ((js.next_run_time%10000)/100)*60 + (js.next_run_time%100),
+                                    CONVERT(datetime, CONVERT(char(8), js.next_run_date), 112)
+                                  )
+                        END
+                FROM msdb.dbo.sysjobschedules js
+            )
+            SELECT @Html +=
+                N'<h3>SQL Agent Job Summary (Enabled)</h3>'
+              + N'<table><tr>'
+              + N'<th>Job</th><th>Category</th><th>Owner</th><th>Enabled</th><th>Last Run</th><th>Last Status</th><th>Next Run</th>'
+              + N'</tr>'
+              + ISNULL((
+                    SELECT STRING_AGG(
+                        CAST(
+                            N'<tr>'
+                          + N'<td>' + CAST(jb.job_name AS nvarchar(512)) + N'</td>'
+                          + N'<td>' + CAST(jb.category_name AS nvarchar(256)) + N'</td>'
+                          + N'<td>' + CAST(ISNULL(jb.owner_name, N'-') AS nvarchar(256)) + N'</td>'
+                          + N'<td>Yes</td>'
+                          + N'<td>' + ISNULL(CONVERT(nvarchar(30), lr.last_run_dt, 120), N'-') + N'</td>'
+                          + N'<td>'
+                          + CASE WHEN lr.run_status_desc = 'Succeeded' THEN N'<span class="ok">Succeeded</span>'
+                                 WHEN lr.run_status_desc = 'Failed'    THEN N'<span class="bad">Failed</span>'
+                                 WHEN lr.run_status_desc IS NULL       THEN N'-'
+                                 ELSE N'<span class="warn">' + CAST(lr.run_status_desc AS nvarchar(64)) + N'</span>'
+                            END
+                          + N'</td>'
+                          + N'<td>' + ISNULL(CONVERT(nvarchar(30), nr.next_run_dt, 120), N'-') + N'</td>'
+                          + N'</tr>'
+                        AS nvarchar(max)
+                        ) COLLATE DATABASE_DEFAULT
+                    , N'') WITHIN GROUP (ORDER BY jb.job_name COLLATE DATABASE_DEFAULT)
+                    FROM JobBase2 jb
+                    LEFT JOIN (SELECT job_id, last_run_dt, run_status_desc FROM LastRun2 WHERE rn = 1) lr
+                        ON lr.job_id = jb.job_id
+                    LEFT JOIN (SELECT job_id, MIN(next_run_dt) AS next_run_dt FROM NextRun2 GROUP BY job_id) nr
+                        ON nr.job_id = jb.job_id
+                    WHERE jb.enabled = 1
+                ), N'<tr><td colspan="7">No enabled jobs found.</td></tr>')
+              + N'</table>';
+        END
+
+        ---------------------------------------------------------------------
+        -- TABLE DETAILS (Top N largest tables per DB) - optional
+        -- Uses sys.dm_db_partition_stats (safe and avoids allocation duplicates)
+        ---------------------------------------------------------------------
+        IF @include_table_details = 1
+        BEGIN
+            CREATE TABLE #TableDetails
+            (
+                  DatabaseName sysname NOT NULL
+                , SchemaName   sysname NOT NULL
+                , TableName    sysname NOT NULL
+                , [RowCount]   bigint  NULL
+                , ReservedMB   decimal(19,2) NULL
+                , DataMB       decimal(19,2) NULL
+                , IndexMB      decimal(19,2) NULL
+                , UnusedMB     decimal(19,2) NULL
+            );
+
+            DECLARE @db sysname, @sql nvarchar(max);
+
+            DECLARE db_cur CURSOR LOCAL FAST_FORWARD FOR
+                SELECT name
+                FROM sys.databases
+                WHERE state_desc = 'ONLINE'
+                  AND is_read_only = 0
+                  AND (@include_system_dbs = 1 OR database_id > 4);
+
+            OPEN db_cur;
+            FETCH NEXT FROM db_cur INTO @db;
+
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @sql = N'
+USE ' + QUOTENAME(@db) + N';
+
+;WITH TS AS
+(
+    SELECT
+          DB_NAME() AS DatabaseName
+        , s.name AS SchemaName
+        , t.name AS TableName
+        , SUM(CASE WHEN ps.index_id IN (0,1) THEN ps.row_count ELSE 0 END) AS [RowCount]
+        , CAST(SUM(ps.reserved_page_count) * 8.0 / 1024 AS decimal(19,2)) AS ReservedMB
+        , CAST(SUM(ps.in_row_data_page_count + ps.lob_used_page_count + ps.row_overflow_used_page_count) * 8.0 / 1024 AS decimal(19,2)) AS DataMB
+        , CAST((SUM(ps.used_page_count) - SUM(ps.in_row_data_page_count + ps.lob_used_page_count + ps.row_overflow_used_page_count)) * 8.0 / 1024 AS decimal(19,2)) AS IndexMB
+        , CAST((SUM(ps.reserved_page_count) - SUM(ps.used_page_count)) * 8.0 / 1024 AS decimal(19,2)) AS UnusedMB
+    FROM sys.tables t
+    INNER JOIN sys.schemas s
+        ON t.schema_id = s.schema_id
+    INNER JOIN sys.dm_db_partition_stats ps
+        ON ps.object_id = t.object_id
+    WHERE t.is_ms_shipped = 0
+    GROUP BY s.name, t.name
+)
+INSERT INTO #TableDetails (DatabaseName, SchemaName, TableName, [RowCount], ReservedMB, DataMB, IndexMB, UnusedMB)
+SELECT TOP (@TopN)
+       DatabaseName, SchemaName, TableName, [RowCount], ReservedMB, DataMB, IndexMB, UnusedMB
+FROM TS
+WHERE ReservedMB >= @MinMB
+ORDER BY ReservedMB DESC;
+';
+
+                BEGIN TRY
+                    EXEC sys.sp_executesql
+                          @sql
+                        , N'@TopN int, @MinMB decimal(19,2)'
+                        , @TopN  = @top_tables_per_db
+                        , @MinMB = @min_table_mb;
+                END TRY
+                BEGIN CATCH
+                    -- If no permission / error, skip DB silently.
+                END CATCH;
+
+                FETCH NEXT FROM db_cur INTO @db;
+            END
+
+            CLOSE db_cur;
+            DEALLOCATE db_cur;
+
+            SET @Html +=
+                N'<h3>Top Tables by Size (per database)</h3>'
+              + N'<div class="small">Top ' + CONVERT(nvarchar(10), @top_tables_per_db)
+              + N' tables per DB where ReservedMB >= ' + CONVERT(nvarchar(30), @min_table_mb) + N' MB.</div>'
+              + N'<table><tr>'
+              + N'<th>Database</th><th>Schema</th><th>Table</th><th>Rows</th><th>Reserved (MB)</th><th>Data (MB)</th><th>Index (MB)</th><th>Unused (MB)</th>'
+              + N'</tr>'
+              + CASE WHEN EXISTS (SELECT 1 FROM #TableDetails)
+                     THEN ISNULL((
+                        SELECT STRING_AGG(
+                            CAST(
+                                N'<tr>'
+                              + N'<td>' + CAST(DatabaseName AS nvarchar(256)) + N'</td>'
+                              + N'<td>' + CAST(SchemaName   AS nvarchar(256)) + N'</td>'
+                              + N'<td>' + CAST(TableName    AS nvarchar(256)) + N'</td>'
+                              + N'<td>' + CONVERT(nvarchar(30), [RowCount])   + N'</td>'
+                              + N'<td>' + CONVERT(nvarchar(30), ReservedMB)   + N'</td>'
+                              + N'<td>' + CONVERT(nvarchar(30), DataMB)       + N'</td>'
+                              + N'<td>' + CONVERT(nvarchar(30), IndexMB)      + N'</td>'
+                              + N'<td>' + CONVERT(nvarchar(30), UnusedMB)     + N'</td>'
+                              + N'</tr>'
+                            AS nvarchar(max)
+                            ) COLLATE DATABASE_DEFAULT
+                        , N'') WITHIN GROUP
+                          (ORDER BY ReservedMB DESC, DatabaseName COLLATE DATABASE_DEFAULT, SchemaName COLLATE DATABASE_DEFAULT, TableName COLLATE DATABASE_DEFAULT)
+                        FROM #TableDetails
+                     ), N'')
+                     ELSE N'<tr><td colspan="8">No tables matched the threshold / permissions.</td></tr>'
+                END
+              + N'</table>';
+
+            DROP TABLE #TableDetails;
+        END
+
+        ---------------------------------------------------------------------
+        -- Alerts Summary (low disks, non-online DBs, failed jobs exist)
+        ---------------------------------------------------------------------
+        ;WITH VolAlert AS
+        (
+            SELECT DISTINCT
+                  v.volume_mount_point
+                , pct_free = CAST((v.available_bytes * 100.0) / NULLIF(v.total_bytes,0) AS decimal(9,2))
+            FROM sys.master_files mf
+            CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) v
+        ),
+        BadDbs AS
+        (
+            SELECT name, state_desc
+            FROM sys.databases
+            WHERE (@include_system_dbs = 1 OR database_id > 4)
+              AND state_desc <> 'ONLINE'
+        )
+        SELECT @Html +=
+            N'<h3>Alerts (Summary)</h3>'
+          + N'<table><tr><th>Type</th><th>Details</th></tr>'
+          + ISNULL((
+                SELECT STRING_AGG(
+                    CAST(
+                        N'<tr><td>Disk</td><td>Low free space on <b>'
+                      + CAST(volume_mount_point AS nvarchar(512))
+                      + N'</b> (' + CONVERT(nvarchar(30), pct_free) + N'% free)</td></tr>'
+                    AS nvarchar(max)
+                    ) COLLATE DATABASE_DEFAULT
+                , N'') WITHIN GROUP (ORDER BY pct_free ASC, volume_mount_point COLLATE DATABASE_DEFAULT)
+                FROM VolAlert
+                WHERE pct_free < @low_disk_pct_free
+            ), N'')
+          + ISNULL((
+                SELECT STRING_AGG(
+                    CAST(
+                        N'<tr><td>Database</td><td><b>'
+                      + CAST(name AS nvarchar(256))
+                      + N'</b> is <span class="bad">'
+                      + CAST(state_desc AS nvarchar(60))
+                      + N'</span></td></tr>'
+                    AS nvarchar(max)
+                    ) COLLATE DATABASE_DEFAULT
+                , N'') WITHIN GROUP (ORDER BY name COLLATE DATABASE_DEFAULT)
+                FROM BadDbs
+            ), N'')
+          + CASE
+                WHEN NOT EXISTS (SELECT 1 FROM VolAlert WHERE pct_free < @low_disk_pct_free)
+                 AND NOT EXISTS (SELECT 1 FROM BadDbs)
+                THEN N'<tr><td colspan="2"><span class="ok">No alerts.</span></td></tr>'
+                ELSE N''
+            END
+          + N'</table>';
+
+        ---------------------------------------------------------------------
+        -- Close HTML and send/return
+        ---------------------------------------------------------------------
+        SET @Html += N'</body></html>';
+
+        IF @send_mail = 1
+        BEGIN
+            EXEC msdb.dbo.sp_send_dbmail
+                  @profile_name    = @profile_name
+                , @recipients      = @recipients
+                , @copy_recipients = @copy_recipients
+                , @subject         = @subject
+                , @body            = @Html
+                , @body_format     = 'HTML';
+        END
+        ELSE
+        BEGIN
+            SELECT @Html AS HtmlBody;
+        END
+    END TRY
+    BEGIN CATCH
+        DECLARE @Err nvarchar(4000) = ERROR_MESSAGE();
+        RAISERROR(N'usp_SendDailySummaryReport_All failed: %s', 16, 1, @Err);
+        RETURN;
+    END CATCH
+END;
+GO
