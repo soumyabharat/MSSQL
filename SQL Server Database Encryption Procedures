@@ -1,0 +1,75 @@
+
+
+--ceate master key
+USE master;
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'Soumya@123';--use storng password
+-- create certificate
+USE master;
+CREATE CERTIFICATE TDECert
+   WITH SUBJECT = 'TDE Certificate';
+--certificate backup
+BACKUP CERTIFICATE TDECert
+   TO FILE = 'C:\Backup\TDECert.cer'
+   WITH PRIVATE KEY (
+       FILE = 'C:\Backup\TDECert_PrivateKey.pvk',
+       ENCRYPTION BY PASSWORD = 'Soumya@1234'-- use strong diffrent password for backup , required again using for certificate restoration
+   );
+--create certificate DB
+   USE DB1;
+CREATE DATABASE ENCRYPTION KEY
+   WITH ALGORITHM = AES_256
+   ENCRYPTION BY SERVER CERTIFICATE TDECert;
+--enable TDE 
+   ALTER DATABASE DB1
+   SET ENCRYPTION ON;
+--verify encription
+ SELECT db.name, dm.encryption_state, dm.percent_complete
+FROM sys.databases db
+JOIN sys.dm_database_encryption_keys dm
+ON db.database_id = dm.database_id;
+--backup database
+backup database db1 to disk = 'C:\Backup\dba1.bak';
+
+
+--Disable encription DB
+ALTER DATABASE DB1
+SET ENCRYPTION OFF;
+--delete database certificate
+   USE DB1;
+DROP DATABASE ENCRYPTION KEY;
+--delete master certificate
+USE master;
+DROP CERTIFICATE TDECert;
+--delete master key
+USE master;
+DROP MASTER KEY;
+-- restore encripted database diffrent server
+USE master;
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'Soumya@123';--use storng password
+
+--restore backup certificate using backup password.
+USE master;
+CREATE CERTIFICATE TDECert
+   FROM FILE = 'C:\Backup\TDECert.cer'
+   WITH PRIVATE KEY (
+       FILE = 'C:\Backup\TDECert_PrivateKey.pvk',
+       DECRYPTION BY PASSWORD = 'Soumya@1234'
+   );
+--Restore database 
+Restore database DB1 from disk ='C:\backup\dba1.bak';
+
+--enable TDE certificate
+   ALTER DATABASE DB1
+   SET ENCRYPTION ON;
+--verify cetificate enable
+
+
+SELECT db.name, dm.encryption_state, dm.percent_complete
+FROM sys.databases db
+JOIN sys.dm_database_encryption_keys dm
+ON db.database_id = dm.database_id;
+--drop database
+Drop database db1
+
+
+
