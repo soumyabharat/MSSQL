@@ -1,0 +1,112 @@
+ **full rebuild and restore process for SQL Server system databases (master, model, msdb)** in detail. This is the “from scratch” procedure you’d use if corruption or unrecoverable issues exist.
+
+---
+--if sql server not connect in cmd Download and install the sqlcmd utility  : https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-download-install?view=sql-server-ver17&tabs=windows
+--if unable to install utility Download ODBC Driver for SQL Server :https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-download-install?view=sql-server-ver17&tabs=windows
+## 🔹 Step 1: Backup all database 
+- Stop SQL Server
+- Open **SQL Server Configuration Manager** or `services.msc`.
+- Stop the SQL Server service and SQL Server Agent service.
+
+---
+
+## 🔹 Step 2: Rebuild System Databases
+1. Open a command prompt as Administrator.
+2. Navigate to the SQL Server setup folder (where `setup.exe` is located).
+3. Run:
+   ```cmd run as admin
+
+--C:\Program Files\Microsoft SQL Server\150\Setup Bootstrap\SQL2019>setup /QUIET /ACTION=REBUILDDATABASE /INSTANCENAME=BHARAT /SQLSYSADMINACCOUNTS="bharat\soumy" /SAPWD="Soumya@1234!" /SQLCOLLATION=SQL_Latin1_General_CP1_CI_AS
+  
+   ```
+   - Replace `MSSQLSERVER` with your instance name if not default.
+   - Replace `domain\user` with your Windows account that should be sysadmin.
+4. This rebuilds **master, model, msdb, tempdb** to their default state.
+
+---
+
+## 🔹 Step 3: Apply Service Packs / Cumulative Updates
+- After rebuild, your system databases are at the base install level.
+- Reapply the same **patch level (SP/CU)** that your backups were taken on.
+- This ensures compatibility when restoring.
+
+---
+
+## 🔹 Step 4: Restore `master`
+1. Start SQL Server in **single-user mode**:
+   - Add `-m` to startup parameters in SQL Server Configuration Manager, or run:
+     ```cmd run as admin
+
+     -C:\Program Files\Microsoft SQL Server\MSSQL15.BHARAT\MSSQL\Binn>sqlservr.exe -m -s BHARAT
+     ```
+2. Connect using **SQLCMD** (only one connection allowed).
+--C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn>SQLCMD.EXE -S bharat -E
+3. Run:
+   ```RESTORE DATABASE master 
+FROM DISK = 'C:\Program Files\Microsoft SQL Server\MSSQL15.BHARAT\MSSQL\Backup\master_backup_2026_04_04_082838_2819209.bak'
+WITH REPLACE;
+GO
+   ```
+4. Restart SQL Server normally (remove `-m`).
+
+---
+
+## 🔹 Step 5: Restore `msdb` using ssms
+1. Stop SQL Server Agent service (it keeps connections to msdb).
+2. Connect to SQL Server in normal mode.
+3. Run:
+   ```sql
+   USE master;
+   ALTER DATABASE msdb SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+
+   RESTORE DATABASE msdb 
+   FROM DISK = 'C:\Backup\msdb.bak' 
+   WITH REPLACE;
+
+   ALTER DATABASE msdb SET MULTI_USER;
+   ```
+4. Restart SQL Server service.
+5. Verify SQL Agent jobs, alerts, operators.
+
+---
+
+## 🔹 Step 6: Restore `model`
+1. Connect to SQL Server. using ssms
+2. Run:
+   ```sql
+   USE master;
+   ALTER DATABASE model SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+
+   RESTORE DATABASE model 
+   FROM DISK = 'C:\Backup\model.bak' 
+   WITH REPLACE;
+
+   ALTER DATABASE model SET MULTI_USER;
+   ```
+3. Restart SQL Server service.
+4. Test creating a new database (to confirm `model` is healthy).
+
+---
+
+## 🔹 Step 7: Post-Restore Validation
+- **Logins**: Verify they exist and map correctly.
+- **Jobs**: Check SQL Agent jobs, schedules, alerts (from `msdb`).
+- **Defaults**: Confirm `model` settings (collation, recovery model).
+- **Error Logs**: Review SQL Server logs for startup issues.
+- **Backups**: Run a test backup/restore to confirm functionality.
+
+---
+
+## ⚠️ If No Backups Exist
+- You’ll only have the rebuilt default system DBs.
+- You must **recreate logins, jobs, linked servers, and configurations manually**.
+
+---
+
+👉 To make this production-ready, I can prepare a **script bundle** that:
+- Automatically sets single-user mode,
+- Restores the database,
+- Resets back to multi-user,
+- Logs completion time.
+
+Would you like me to draft that bundle so you can run it directly for `master`, `msdb`, and `model` without manual intervention each time?
